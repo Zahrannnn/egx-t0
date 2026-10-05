@@ -14,6 +14,7 @@ import json
 import sys
 from typing import Optional
 
+from .precision import PrecisionProfile, precision_gate, judge_gate
 from .engine import (
     DEFAULT_RISK, DEFAULT_WEIGHTS, RiskConfig, ScoreWeights,
     classify_setup, build_entry_zone, build_risk, score_trade, grade_for,
@@ -29,6 +30,7 @@ def _f(x):
 
 
 def scan(min_score: float = 65.0, top: int = 3, use_judge: bool = False,
+         precision: bool = True,
          risk: RiskConfig = DEFAULT_RISK, weights: ScoreWeights = DEFAULT_WEIGHTS):
     from tradingview_mcp.core.services.egx_service import (
         get_egx_market_overview, screen_egx_stocks, generate_egx_trade_plan,
@@ -101,6 +103,9 @@ def scan(min_score: float = 65.0, top: int = 3, use_judge: bool = False,
             "score": score, "grade": grade,
             "breakdown": breakdown,
             "market_bias": round(market_bias, 2),
+            "_volume_shares": int(vol),
+            "_rsi": _f(g.get("rsi")) or 50.0,
+            "_relative_volume": _f(ind.get("relative_volume")) or 0.0,
             "_plan": plan,
         })
 
@@ -143,19 +148,42 @@ def scan(min_score: float = 65.0, top: int = 3, use_judge: bool = False,
             "score": score, "grade": grade_for(score),
             "breakdown": breakdown,
             "market_bias": round(-market_bias, 2),
+            "_volume_shares": int(vol),
+            "_rsi": _f(l.get("rsi")) or 50.0,
+            "_relative_volume": _f(ind.get("relative_volume")) or 0.0,
             "_plan": plan,
         })
 
     candidates.sort(key=lambda c: c["score"], reverse=True)
 
-    # Judge layer (optional): veto pass on top candidates
-    if use_judge:
-        from .judge import judge_trade
-        for c in candidates[:top]:
-            v = judge_trade(json.dumps({k: v for k, v in c.items() if k != "_plan"}, default=str))
-            c["judgement"] = v or {"verdict": "PASS", "reason": "judge unavailable, fail-open", "confidence": 0}
+    # Precision hard gates (personal-tool profile): fail = dropped, logged
+    profile = PrecisionProfile() if precision else PrecisionProfile.from_flags(strict=False)
+    if precision:
+        gated = []
+        for c in candidates:
+            ok, why = precision_gate(c, profile)
+            if ok:
+                gated.append(c)
+            else:
+                c["precision_reject"] = why
+        candidates_gated = gated
+    else:
+        candidates_gated = candidates
 
-    approved = [c for c in candidates if c.get("judgement", {}).get("verdict") != "VETO"][:top]
+    # Judge layer: under precision, PASS is required (fail-closed)
+    approved = []
+    for c in candidates_gated[:top]:
+        if use_judge or precision:
+            from .judge import judge_trade
+            v = judge_trade(json.dumps({k: v for k, v in c.items() if k != "_plan"}, default=str))
+            c["judgement"] = v
+            ok, why = judge_gate(v, profile)
+            if not ok:
+                c["judge_reject"] = why
+                continue
+        approved.append(c)
+
+    approved = approved[:top]
     return approved, candidates
 
 
@@ -180,9 +208,11 @@ def render(plans: list[dict]) -> str:
         out.append(f"  Potential:           {p['potential_pct']}%")
         out.append(f"  Risk/Reward:         1:{p['rr']}")
         out.append(f"  Score:               {p['score']} / 100  ({p['grade']})")
-        if "judgement" in p:
+        if p.get("judge_reject"):
+            out.append(f"  Judge:               REJECTED - {p['judge_reject']}")
+        elif p.get("judgement") and p["judgement"].get("verdict"):
             j = p["judgement"]
-            out.append(f"  Judge:               {j['verdict']} - {j['reason']}")
+            out.append(f"  Judge:               {j['verdict']} - {j.get('reason', '')}")
         out.append("")
 
     return "\n".join(out)
@@ -194,9 +224,11 @@ def main():
     ap.add_argument("--top", type=int, default=3)
     ap.add_argument("--judge", action="store_true", help="enable GLM veto layer")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--loose", action="store_true", help="disable precision hard gates (research mode)")
     args = ap.parse_args()
 
-    approved, all_c = scan(min_score=args.min_score, top=args.top, use_judge=args.judge)
+    approved, all_c = scan(min_score=args.min_score, top=args.top, use_judge=args.judge,
+                            precision=not args.loose)
 
     if args.json:
         print(json.dumps(approved, indent=1, default=str))
@@ -207,7 +239,10 @@ def main():
     print("=" * 62)
     print(render(approved))
     if not approved:
-        print(f"  (scanned {len(all_c)} candidates; none cleared {args.min_score})")
+        print(f"  ({len(all_c)} candidates scanned)")
+        for c in all_c[:5]:
+            why = c.get("judge_reject") or c.get("precision_reject") or f"score {c['score']} below {args.min_score}"
+            print(f"   - {c['symbol']} {c['direction']} score {c['score']}: {why}")
     print("=" * 62)
     print("Not financial advice. Data via TradingView public endpoints — verify")
     print("delayed/incomplete data before executing. T0: close before market close.")

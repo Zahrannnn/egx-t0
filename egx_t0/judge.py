@@ -40,7 +40,7 @@ def judge_trade(plan_json: str, model: str = "glm-5.3-flash",
     key = _load_key()
     body = json.dumps({
         "model": model,
-        "max_tokens": 600,
+        "max_tokens": 2000,
         "system": SYSTEM,
         "messages": [{
             "role": "user",
@@ -62,10 +62,22 @@ def judge_trade(plan_json: str, model: str = "glm-5.3-flash",
             data = json.loads(r.read().decode())
         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
         start, end = text.find("{"), text.rfind("}")
-        if start == -1 or end == -1:
+        if start == -1:
             return None
-        parsed = json.loads(text[start:end + 1])
-        if parsed.get("verdict") not in ("PASS", "VETO"):
+        raw = text[start:end + 1] if end != -1 else text[start:]
+        # tolerate truncation: close dangling quotes/braces
+        if end == -1:
+            raw = raw.rstrip().rstrip(',"').rstrip() + '"}'
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        verdict = str(parsed.get("verdict", "")).upper()
+        if verdict in ("PASS",):
+            parsed["verdict"] = "PASS"
+        elif verdict in ("VETO", "FAIL", "REJECT", "NO"):
+            parsed["verdict"] = "VETO"
+        else:
             return None
         return parsed
     except Exception:
