@@ -1,74 +1,202 @@
+<div align="center">
+
 # EGX T0 Agent
 
 **Intraday T+0 trade agent for the Egyptian Stock Exchange.**
-Deterministic quant engine (setups, entry zones, risk, scoring) + skeptical
-LLM judge layer (veto-only) + plain-language explanations. Live market data
-via the TradingView MCP server (`tradingview-mcp-server`).
 
-**Not financial advice.** Educational tool. T0 means flat before close.
+Deterministic quant engine. Skeptical LLM veto layer. Zero garbage output.
 
-## Install
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)]()
+[![License](https://img.shields.io/badge/license-MIT-green.svg)]()
+[![Discipline](https://img.shields.io/badge/philosophy-precision%20over%20recall-cfa355.svg)]()
+
+*Not financial advice. Educational tool. T0 means flat before the close — always.*
+
+</div>
+
+---
+
+## Why this exists
+
+Most "AI trading agents" are chatbots with a price feed. They hallucinate
+entries, invent indicators, and always have an opinion. This tool is built
+on the opposite premise:
+
+> **When it speaks, every number survived eight independent gates plus a
+> skeptical LLM reading. On most days it says NO TRADE — and that is the
+> product working.**
+
+Three architectural rules make that real:
+
+1. **The math never lies.** All indicators, entry zones, stops, and scores
+   are computed by a deterministic engine with zero LLM involvement.
+   Identical inputs produce identical plans — which is what makes
+   backtesting meaningful.
+2. **The LLM may only say no.** The judge layer reads computed plans and can
+   VETO with a reason. It cannot create trades, adjust prices, or raise
+   scores. Fail-closed: no judgment means no trade.
+3. **Entry is a zone, never a price.** Ideal / acceptable / NO-CHASE bands
+   derived from VWAP and ATR. Chasing is refused by design.
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ DATA          tradingview-mcp-server (self-hosted, free) │
+│               ~234 EGX names: price, OHLC, volume, RSI,  │
+│               ratings — via public TradingView endpoints  │
+└──────────────┬───────────────────────────────────────────┘
+               ▼
+┌──────────────────────────────────────────────────────────┐
+│ FILTER        liquidity ≥ 100k shares · sane price band   │
+│               relative volume ≥ 1.4                       │
+└──────────────┬───────────────────────────────────────────┘
+               ▼
+┌──────────────────────────────────────────────────────────┐
+│ SETUP ENGINE  state machine (deterministic):              │
+│               PRE-SETUP → CONFIRMED → ENTERABLE           │
+│                        → EXTENDED (NO CHASE) → INVALID    │
+└──────────────┬───────────────────────────────────────────┘
+               ▼
+┌──────────────────────────────────────────────────────────┐
+│ ENTRY ZONE    VWAP + 0.15–0.5 ATR bands                   │
+│               ideal · acceptable · chase threshold        │
+└──────────────┬───────────────────────────────────────────┘
+               ▼
+┌──────────────────────────────────────────────────────────┐
+│ RISK          technical stop (invalidation, not %)        │
+│               TP1 / TP2 · RR ≥ 2.5 · 1% equity risk      │
+│               EGX board-lot sizing (100s)                 │
+└──────────────┬───────────────────────────────────────────┘
+               ▼
+┌──────────────────────────────────────────────────────────┐
+│ SCORING       0–100, published weights:                   │
+│               structure 20 · volume 20 · VWAP 15          │
+│               trend 15 · level 10 · momentum 10           │
+│               market 10 · state & RR multipliers          │
+└──────────────┬───────────────────────────────────────────┘
+               ▼
+┌──────────────────────────────────────────────────────────┐
+│ PRECISION     hard gates: score ≥ 80 (A/A+ only)          │
+│ GATES         CONFIRMED/ENTERABLE only · ≥4/7 confluence  │
+│               RSI band · market-bias confirmation         │
+└──────────────┬───────────────────────────────────────────┘
+               ▼
+┌──────────────────────────────────────────────────────────┐
+│ JUDGE         LLM skeptical review (GLM today, Jev-ready) │
+│               veto-only · fail-closed · logs reasons      │
+└──────────────┬───────────────────────────────────────────┘
+               ▼
+        TOP 3 RANKED PLANS  —  or  **NO TRADE**
+```
+
+## The precision gates
+
+The personal-tool profile. Any single failure drops the setup with a logged reason:
+
+| Gate | Requirement |
+|---|---|
+| Grade | **A / A+ only** (score ≥ 80) — B-watch suppressed |
+| Risk/Reward | **≥ 1 : 2.5** |
+| Setup state | CONFIRMED or ENTERABLE — nothing earlier, nothing extended |
+| Confluence | **≥ 4 of 7** independent factors at ≥ 0.70 each |
+| Liquidity | volume ≥ 100k shares · relative volume ≥ 1.4 |
+| Momentum band (longs) | RSI 52–74 — directional but not extended |
+| Market bias | index/sector must confirm the direction |
+| Judge | PASS required — unavailable judge blocks the trade |
+
+**Expected output frequency: 0–2 A-grade setups per week.** That is the
+design, not a limitation. The tool refuses to manufacture opportunities.
+
+## Quick start
 
 ```bash
 pip install tradingview-mcp-server
-# then run from this repo root:
-python -m egx_t0.scan --min-score 65
+git clone https://github.com/Zahrannnn/egx-t0.git
+cd egx-t0
+
+# strict precision mode (the default — expect NO TRADE most days)
+python -m egx_t0.scan
+
+# with the LLM veto judge (needs GLM_API_KEY)
+python -m egx_t0.scan --judge
+
+# research mode: loose gates, see everything the engine considered
+python -m egx_t0.scan --loose --min-score 40
+
+# machine output for ZCode / MCP integration
+python -m egx_t0.scan --json
 ```
 
-## What it does each run
+## Example output
 
-1. `egx_market_overview` — live EGX scan (top gainers/losers, ~234 names)
-2. Liquidity + price filters (volume ≥ 50k shares, sane price band)
-3. Per candidate: `generate_egx_trade_plan` for full indicators
-4. Setup state machine: PRE-SETUP → CONFIRMED → ENTERABLE → EXTENDED → INVALID
-5. **Entry ZONE** (never a single price): ideal / acceptable / NO-CHASE bands
-   derived from VWAP + ATR
-6. Risk engine: technical stop (not arbitrary %), TP1/TP2, R:R ≥ 2 required,
-   position size from 1% account risk, EGX board-lot rounding
-7. Transparent 0-100 score (structure 20% / volume 20% / VWAP 15% / trend 15% /
-   level 10% / momentum 10% / market 10%) with state + RR multipliers
-8. Grades: 85+ A+ · 75+ A · 65+ B · below = **NO TRADE**
-9. Optional `--judge`: GLM skeptical veto (finds thin volume, news spikes,
-   index divergence). Fail-open, veto-only, may never raise a score.
-10. Output: top 3 or fewer. **If nothing qualifies: NO TRADE.**
-
-## Commands
-
-```bash
-python -m egx_t0.scan                     # default (min score 65, top 3)
-python -m egx_t0.scan --min-score 45      # looser, for research
-python -m egx_t0.scan --judge             # GLM veto layer ON
-python -m egx_t0.scan --json              # machine output (for ZCode/MCP)
+```
+==============================================================
+EGX T0 AGENT — TOP OPPORTUNITIES
+==============================================================
+NO TRADE — no setups passed quality thresholds today.
+  (6 candidates scanned)
+   - PRDC  SHORT 52.7: judge veto: relative volume 0.0 makes liquidity
+     unverifiable; SSR availability unconfirmed for short
+   - EGS370O1C013 LONG 46.4: judge veto: RSI 70.8 overbought, breakout
+     unconfirmed
+==============================================================
 ```
 
-## Architecture (why it's not a prompt)
+Every rejection carries its reason. A NO TRADE day is a successful run —
+the gates did their job.
 
-- `engine.py` — deterministic math. No LLM. Identical inputs → identical plan.
-- `judge.py` — LLM reads the plan and may VETO with a reason. It may never
-  create trades, change prices, or raise scores. GLM today, Jev when keys ship.
-- `scan.py` — orchestration + rendering.
+## Repo layout
 
-This separation means backtesting replays the exact same setup engine that
-runs live, and the LLM layer can never hallucinate a price (it only reads
-engine output).
+| File | Role |
+|---|---|
+| `egx_t0/engine.py` | Deterministic core: setup state machine, entry zones, risk, scoring. No LLM imports. |
+| `egx_t0/precision.py` | Hard gates + fail-closed judge application. The "zero garbage" profile. |
+| `egx_t0/judge.py` | LLM veto layer (GLM via Anthropic-style endpoint; Jev-ready swap). Tolerant JSON parsing. |
+| `egx_t0/scan.py` | Orchestration + CLI + rendering with reject transparency. |
 
-## Short-selling note
+## Design decisions worth knowing
 
-EGX short selling is heavily restricted. Breakdown setups are emitted as
-**WATCH — verify SSR availability** unless you've confirmed your broker
-supports intraday shorts on that ticker. Longs are unaffected.
+- **Veto-only LLM.** The judge finds failure modes (thin volume, news spikes,
+  index divergence, overbought entries) — it never approves a trade the
+  numbers already failed, and never rescues one with optimism.
+- **Fail-closed over fail-open.** If the judge is unreachable, the trade
+  doesn't happen. Silence beats an unvetted signal.
+- **Determinism first.** Because the engine is pure, the planned backtester
+  replays the exact same logic on historical candles — no rewrite, no drift
+  between live and tested behavior.
+- **Shorts are WATCH-only.** EGX short selling is heavily restricted; every
+  short setup is labeled "verify SSR availability" until your broker
+  confirms otherwise.
+- **Costs are not modeled yet.** Until commissions/slippage enter the
+  backtester, treat live results as an upper bound.
 
-## Backtesting
+## Roadmap
 
-Backtester replays historical candles through the same setup engine
-(train/test split, out-of-sample). Tracks win rate, avg win/loss, profit
-factor, max drawdown, expectancy, avg R, per-setup/per-ticker/per-hour
-breakdown. (In progress — the engine is already deterministic, which is the
-hard part.)
+- [x] Live EGX scan (data → filter → setups → zones → risk → score)
+- [x] Precision hard gates + fail-closed judge
+- [x] Reject-reason transparency
+- [ ] Backtester: replay candles through the same engine, train/test split,
+      cost model, per-setup/per-hour expectancy
+- [ ] Own indicator computation from raw candles (golden-fixture tested)
+- [ ] Data-quality gate (stale/degraded feed ⇒ automatic NO TRADE)
+- [ ] Trade management loop (partials, breakeven, trailing, T0 flat close)
+- [ ] ZCode skill + MCP server wrapper
 
-## Honesty
+## Honest limitations
 
-- TradingView public endpoints can be delayed. The agent flags this every run.
-- LLM judgments fail open and never fabricate numbers, but they are opinions.
-- Nothing here is financial advice. You will lose money on some trades; the
-  point of the gates is to make those losses small, rare, and planned.
+- TradingView public endpoints can be **delayed**. The agent states this on
+  every run; verify data before acting.
+- The judge is an LLM: its vetoes are opinions, strongly correlated with the
+  computed numbers but not ground truth. The decision log exists precisely
+  so its calibration can be measured over time.
+- No system wins 99% of trades. This one is built so that **99% of its output
+  is either excellent or honestly silent** — expectancy comes from R:R on
+  the few setups that clear every gate.
+
+## License
+
+MIT — with the standing disclaimer that this is analysis tooling, not
+financial advice. EGX intraday is thin and violent; the gates exist because
+losses are the default outcome without them. You are responsible for your
+own execution.
